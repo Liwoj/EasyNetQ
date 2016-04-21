@@ -1,230 +1,249 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
+using EasyNetQ.Consumer;
 using EasyNetQ.FluentConfiguration;
+using EasyNetQ.Producer;
 using EasyNetQ.Topology;
+using System.Linq;
+using EasyNetQ.Internals;
 
 namespace EasyNetQ
 {
     public class RabbitBus : IBus
     {
-        private readonly SerializeType serializeType;
-        private readonly IEasyNetQLogger logger;
         private readonly IConventions conventions;
         private readonly IAdvancedBus advancedBus;
-        
-        public SerializeType SerializeType
-        {
-            get { return serializeType; }
-        }
-
-        public IEasyNetQLogger Logger
-        {
-            get { return logger; }
-        }
-
-        public IConventions Conventions
-        {
-            get { return conventions; }
-        }
+        private readonly IPublishExchangeDeclareStrategy publishExchangeDeclareStrategy;
+        private readonly IMessageDeliveryModeStrategy messageDeliveryModeStrategy;
+        private readonly IRpc rpc;
+        private readonly ISendReceive sendReceive;
+        private readonly ConnectionConfiguration connectionConfiguration;
 
         public RabbitBus(
-            SerializeType serializeType,
-            IEasyNetQLogger logger,
             IConventions conventions,
-            IAdvancedBus advancedBus)
+            IAdvancedBus advancedBus,
+            IPublishExchangeDeclareStrategy publishExchangeDeclareStrategy,
+            IMessageDeliveryModeStrategy messageDeliveryModeStrategy,
+            IRpc rpc,
+            ISendReceive sendReceive,
+            ConnectionConfiguration connectionConfiguration)
         {
-            if (serializeType == null)
-            {
-                throw new ArgumentNullException("serializeType");
-            }
-            if (logger == null)
-            {
-                throw new ArgumentNullException("logger");
-            }
-            if (conventions == null)
-            {
-                throw new ArgumentNullException("conventions");
-            }
+            Preconditions.CheckNotNull(conventions, "conventions");
+            Preconditions.CheckNotNull(advancedBus, "advancedBus");
+            Preconditions.CheckNotNull(publishExchangeDeclareStrategy, "publishExchangeDeclareStrategy");
+            Preconditions.CheckNotNull(rpc, "rpc");
+            Preconditions.CheckNotNull(sendReceive, "sendReceive");
+            Preconditions.CheckNotNull(connectionConfiguration, "connectionConfiguration");
 
-            this.serializeType = serializeType;
-            this.logger = logger;
             this.conventions = conventions;
             this.advancedBus = advancedBus;
-
-            advancedBus.Connected += OnConnected;
-            advancedBus.Disconnected += OnDisconnected;
+            this.publishExchangeDeclareStrategy = publishExchangeDeclareStrategy;
+            this.messageDeliveryModeStrategy = messageDeliveryModeStrategy;
+            this.rpc = rpc;
+            this.sendReceive = sendReceive;
+            this.connectionConfiguration = connectionConfiguration;
         }
 
-        public virtual IPublishChannel OpenPublishChannel()
+        public virtual void Publish<T>(T message) where T : class
         {
-            return OpenPublishChannel(x => { });
+            Preconditions.CheckNotNull(message, "message");
+
+            Publish(message, conventions.TopicNamingConvention(typeof(T)));
         }
 
-        public virtual IPublishChannel OpenPublishChannel(Action<IChannelConfiguration> configure)
+        public virtual void Publish<T>(T message, string topic) where T : class
         {
-            return new RabbitPublishChannel(this, configure, conventions);
-        }
-
-        public virtual void Subscribe<T>(string subscriptionId, Action<T> onMessage)
-        {
-            Subscribe(subscriptionId, onMessage, x => { });
-        }
-
-        public virtual void Subscribe<T>(string subscriptionId, Action<T> onMessage, Action<ISubscriptionConfiguration<T>> configure)
-        {
-            SubscribeAsync(subscriptionId, msg =>
+            Preconditions.CheckNotNull(message, "message");
+            Preconditions.CheckNotNull(topic, "topic");
+            var messageType = typeof(T);
+            var easyNetQMessage = new Message<T>(message)
             {
-                var tcs = new TaskCompletionSource<object>();
-                try
+                Properties =
                 {
-                    onMessage(msg);
-                    tcs.SetResult(null);
+                    DeliveryMode = messageDeliveryModeStrategy.GetDeliveryMode(messageType)
                 }
-                catch (Exception exception)
+            };
+            var exchange = publishExchangeDeclareStrategy.DeclareExchange(advancedBus, messageType, ExchangeType.Topic);
+            advancedBus.Publish(exchange, topic, false, easyNetQMessage); 
+        }
+
+        public virtual Task PublishAsync<T>(T message) where T : class
+        {
+            Preconditions.CheckNotNull(message, "message");
+
+            return PublishAsync(message, conventions.TopicNamingConvention(typeof(T)));
+        }
+
+        public virtual async Task PublishAsync<T>(T message, string topic) where T : class
+        {
+            Preconditions.CheckNotNull(message, "message");
+            Preconditions.CheckNotNull(topic, "topic");
+            var messageType = typeof (T);
+            var easyNetQMessage = new Message<T>(message)
+            {
+                Properties =
                 {
-                    tcs.SetException(exception);
+                    DeliveryMode = messageDeliveryModeStrategy.GetDeliveryMode(messageType)
                 }
-                return tcs.Task;
-            },
-            configure);
+            };
+            var exchange = await publishExchangeDeclareStrategy.DeclareExchangeAsync(advancedBus, messageType, ExchangeType.Topic).ConfigureAwait(false);
+            await advancedBus.PublishAsync(exchange, topic, false, easyNetQMessage).ConfigureAwait(false); 
         }
 
-        public virtual void SubscribeAsync<T>(string subscriptionId, Func<T, Task> onMessage)
+        public virtual ISubscriptionResult Subscribe<T>(string subscriptionId, Action<T> onMessage) where T : class
         {
-            SubscribeAsync(subscriptionId, onMessage, x => { });
+            return Subscribe(subscriptionId, onMessage, x => { });
         }
 
-        public virtual void SubscribeAsync<T>(string subscriptionId, Func<T, Task> onMessage, Action<ISubscriptionConfiguration<T>> configure)
+        public virtual ISubscriptionResult Subscribe<T>(string subscriptionId, Action<T> onMessage, Action<ISubscriptionConfiguration> configure) where T : class
         {
-            if(subscriptionId == null)
-            {
-                throw new ArgumentNullException("subscriptionId");
-            }
+            Preconditions.CheckNotNull(subscriptionId, "subscriptionId");
+            Preconditions.CheckNotNull(onMessage, "onMessage");
+            Preconditions.CheckNotNull(configure, "configure");
 
-            if (onMessage == null)
-            {
-                throw new ArgumentNullException("onMessage");
-            }
+            return SubscribeAsync<T>(subscriptionId, msg => TaskHelpers.ExecuteSynchronously(() => onMessage(msg)), configure);
+        }
 
-            var configuration = new SubscriptionConfiguration<T>();
+        public virtual ISubscriptionResult SubscribeAsync<T>(string subscriptionId, Func<T, Task> onMessage) where T : class
+        {
+            return SubscribeAsync(subscriptionId, onMessage, x => { });
+        }
+
+        public virtual ISubscriptionResult SubscribeAsync<T>(string subscriptionId, Func<T, Task> onMessage, Action<ISubscriptionConfiguration> configure) where T : class
+        {
+            Preconditions.CheckNotNull(subscriptionId, "subscriptionId");
+            Preconditions.CheckNotNull(onMessage, "onMessage");
+            Preconditions.CheckNotNull(configure, "configure");
+
+            var configuration = new SubscriptionConfiguration(connectionConfiguration.PrefetchCount);
             configure(configuration);
 
-            var queueName = GetQueueName<T>(subscriptionId);
-            var exchangeName = GetExchangeName<T>();
+            var queueName = conventions.QueueNamingConvention(typeof(T), subscriptionId);
+            var exchangeName = conventions.ExchangeNamingConvention(typeof(T));
 
-            var queue = Queue.DeclareDurable(queueName, configuration.Arguments);
-            var exchange = Exchange.DeclareTopic(exchangeName);
+            var queue = advancedBus.QueueDeclare(queueName, autoDelete: configuration.AutoDelete, expires: configuration.Expires);
+            var exchange = advancedBus.ExchangeDeclare(exchangeName, ExchangeType.Topic);
 
-            var topics = configuration.Topics.ToArray();
-
-            if(topics.Length == 0)
+            foreach (var topic in configuration.Topics.DefaultIfEmpty("#"))
             {
-                topics = new[]{"#"};
+                advancedBus.Bind(exchange, queue, topic);
             }
 
-            queue.BindTo(exchange, topics);
-
-            advancedBus.Subscribe<T>(queue, (message, messageRecievedInfo) => onMessage(message.Body));
+            var consumerCancellation = advancedBus.Consume<T>(
+                queue,
+                (message, messageReceivedInfo) => onMessage(message.Body),
+                x =>
+                    {
+                        x.WithPriority(configuration.Priority)
+                         .WithCancelOnHaFailover(configuration.CancelOnHaFailover)
+                         .WithPrefetchCount(configuration.PrefetchCount);
+                        if (configuration.IsExclusive)
+                        {
+                            x.AsExclusive();
+                        }
+                    });
+            return new SubscriptionResult(exchange, queue, consumerCancellation);
         }
 
-        private string GetExchangeName<T>()
+        public virtual TResponse Request<TRequest, TResponse>(TRequest request)
+            where TRequest : class
+            where TResponse : class
         {
-            return conventions.ExchangeNamingConvention(typeof(T));
+            Preconditions.CheckNotNull(request, "request");
+
+            var task = RequestAsync<TRequest, TResponse>(request);
+            task.Wait();
+            return task.Result;
         }
 
-        private string GetQueueName<T>(string subscriptionId)
+        public virtual Task<TResponse> RequestAsync<TRequest, TResponse>(TRequest request)
+            where TRequest : class
+            where TResponse : class
         {
-            return conventions.QueueNamingConvention(typeof(T), subscriptionId);
+            Preconditions.CheckNotNull(request, "request");
+
+            return rpc.Request<TRequest, TResponse>(request);
         }
 
-        public virtual void Respond<TRequest, TResponse>(Func<TRequest, TResponse> responder)
+        public virtual IDisposable Respond<TRequest, TResponse>(Func<TRequest, TResponse> responder)
+            where TRequest : class
+            where TResponse : class
         {
-            Respond(responder, null);
-        }
-
-        public virtual void Respond<TRequest, TResponse>(Func<TRequest, TResponse> responder, IDictionary<string, object> arguments)
-        {
-            if (responder == null)
-            {
-                throw new ArgumentNullException("responder");
-            }
+            Preconditions.CheckNotNull(responder, "responder");
 
             Func<TRequest, Task<TResponse>> taskResponder =
                 request => Task<TResponse>.Factory.StartNew(_ => responder(request), null);
 
-            RespondAsync(taskResponder, arguments);
+            return RespondAsync(taskResponder);
         }
 
-        public virtual void RespondAsync<TRequest, TResponse>(Func<TRequest, Task<TResponse>> responder)
+        public IDisposable Respond<TRequest, TResponse>(Func<TRequest, TResponse> responder, Action<IResponderConfiguration> configure) where TRequest : class where TResponse : class
         {
-            RespondAsync(responder, null);
+            Func<TRequest, Task<TResponse>> taskResponder =
+                request => Task<TResponse>.Factory.StartNew(_ => responder(request), null);
+
+            return RespondAsync(taskResponder, configure);
         }
 
-        public virtual void RespondAsync<TRequest, TResponse>(Func<TRequest, Task<TResponse>> responder, IDictionary<string, object> arguments)
+        public virtual IDisposable RespondAsync<TRequest, TResponse>(Func<TRequest, Task<TResponse>> responder)
+            where TRequest : class
+            where TResponse : class
         {
-            if (responder == null)
-            {
-                throw new ArgumentNullException("responder");
-            }
-
-            var requestTypeName = serializeType(typeof(TRequest));
-
-            var exchange = Exchange.DeclareDirect(conventions.RpcExchangeNamingConvention());
-            var queue = Queue.DeclareDurable(requestTypeName, arguments);
-            queue.BindTo(exchange, requestTypeName);
-
-            advancedBus.Subscribe<TRequest>(queue, (requestMessage, messageRecievedInfo) =>
-            {
-                var tcs = new TaskCompletionSource<object>();
-
-                responder(requestMessage.Body).ContinueWith(task =>
-                {
-                    if (task.IsFaulted)
-                    {
-                        Console.WriteLine("task faulted");
-                        if (task.Exception != null)
-                        {
-                            tcs.SetException(task.Exception);
-                        }
-                    }
-                    else
-                    {
-                        // check we're connected
-                        while (!advancedBus.IsConnected)
-                        {
-                            Thread.Sleep(100);
-                        }
-
-                        var responseMessage = new Message<TResponse>(task.Result);
-                        responseMessage.Properties.CorrelationId = requestMessage.Properties.CorrelationId;
-
-                        using (var channel = advancedBus.OpenPublishChannel())
-                        {
-                            channel.Publish(Exchange.GetDefault(), requestMessage.Properties.ReplyTo, responseMessage, configuration => {});
-                        }
-                        tcs.SetResult(null);
-                    }
-                });
-
-                return tcs.Task;
-            });
+            return RespondAsync(responder, c => { });
         }
 
-        public virtual event Action Connected;
-
-        protected void OnConnected()
+        public IDisposable RespondAsync<TRequest, TResponse>(Func<TRequest, Task<TResponse>> responder, Action<IResponderConfiguration> configure) where TRequest : class where TResponse : class
         {
-            if (Connected != null) Connected();
+            Preconditions.CheckNotNull(responder, "responder");
+            Preconditions.CheckNotNull(configure, "configure");
+
+            return rpc.Respond(responder, configure);
         }
 
-        public virtual event Action Disconnected;
-
-        protected void OnDisconnected()
+        public virtual void Send<T>(string queue, T message)
+            where T : class
         {
-            if (Disconnected != null) Disconnected();
+            sendReceive.Send(queue, message);
+        }
+
+        public virtual Task SendAsync<T>(string queue, T message)
+            where T : class
+        {
+            return sendReceive.SendAsync(queue, message);
+        }
+
+        public virtual IDisposable Receive<T>(string queue, Action<T> onMessage)
+            where T : class
+        {
+            return sendReceive.Receive(queue, onMessage);
+        }
+
+        public virtual IDisposable Receive<T>(string queue, Action<T> onMessage, Action<IConsumerConfiguration> configure)
+            where T : class
+        {
+            return sendReceive.Receive(queue, onMessage, configure);
+        }
+
+        public virtual IDisposable Receive<T>(string queue, Func<T, Task> onMessage)
+            where T : class
+        {
+            return sendReceive.Receive(queue, onMessage);
+        }
+
+        public virtual IDisposable Receive<T>(string queue, Func<T, Task> onMessage, Action<IConsumerConfiguration> configure)
+            where T : class
+        {
+            return sendReceive.Receive(queue, onMessage, configure);
+        }
+
+        public virtual IDisposable Receive(string queue, Action<IReceiveRegistration> addHandlers)
+        {
+            return sendReceive.Receive(queue, addHandlers);
+        }
+
+        public virtual IDisposable Receive(string queue, Action<IReceiveRegistration> addHandlers, Action<IConsumerConfiguration> configure)
+        {
+            return sendReceive.Receive(queue, addHandlers, configure);
         }
 
         public virtual bool IsConnected

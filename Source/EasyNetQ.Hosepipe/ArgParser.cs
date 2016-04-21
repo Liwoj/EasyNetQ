@@ -59,6 +59,24 @@ namespace EasyNetQ.Hosepipe
             return TryResult.Pass();
         }
 
+        public TryResult WithTypedKeyOptional<T>(string key, Action<Argument> argumentAction) where T:IConvertible
+        {
+            if (!keys.ContainsKey(key)) return TryResult.Pass();
+
+            try 
+            {
+                Convert.ChangeType(keys[key].Value, typeof(T));
+            } 
+            catch (InvalidCastException)
+            {
+                return TryResult.Fail();
+            }
+
+            var argument = keys[key];
+            argumentAction(argument);
+            return TryResult.Pass();
+        }
+
         public TryResult At(int position, string command, Action argumentAction)
         {
             if (position < 0 || position >= arguments.Count) return TryResult.Fail();

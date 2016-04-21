@@ -14,26 +14,46 @@ namespace EasyNetQ.ConnectionString
         public static Parser<string> Text = Parse.CharExcept(';').Many().Text();
         public static Parser<ushort> Number = Parse.Number.Select(ushort.Parse);
 
-        public static Parser<IHostConfiguration> Host =
+        public static Parser<bool> Bool = (Parse.CaseInsensitiveString("true").Or(Parse.CaseInsensitiveString("false"))).Text().Select(x => x.ToLower() == "true");
+
+        public static Parser<HostConfiguration> Host =
             from host in Parse.Char(c => c != ':' && c != ';' && c != ',', "host").Many().Text()
             from port in Parse.Char(':').Then(_ => Number).Or(Parse.Return((ushort)0))
-            select new HostConfiguration {Host = host, Port = port};
+            select new HostConfiguration { Host = host, Port = port };
 
-        public static Parser<IEnumerable<IHostConfiguration>> Hosts = Host.ListDelimitedBy(',');
+        public static Parser<IEnumerable<HostConfiguration>> Hosts = Host.ListDelimitedBy(',');
+
+        private static Uri result;
+        public static Parser<Uri> AMQP = Parse.CharExcept(';').Many().Text().Where(x => Uri.TryCreate(x, UriKind.Absolute, out result)).Select(_ => new Uri(_));
 
         public static Parser<UpdateConfiguration> Part = new List<Parser<UpdateConfiguration>>
         {
             // add new connection string parts here
+            BuildKeyValueParser("amqp", AMQP, c => c.AMQPConnectionString),
             BuildKeyValueParser("host", Hosts, c => c.Hosts),
             BuildKeyValueParser("port", Number, c => c.Port),
             BuildKeyValueParser("virtualHost", Text, c => c.VirtualHost),
             BuildKeyValueParser("requestedHeartbeat", Number, c => c.RequestedHeartbeat),
             BuildKeyValueParser("username", Text, c => c.UserName),
             BuildKeyValueParser("password", Text, c => c.Password),
-            BuildKeyValueParser("prefetchcount", Number, c => c.PrefetchCount)
+            BuildKeyValueParser("prefetchcount", Number, c => c.PrefetchCount),
+            BuildKeyValueParser("timeout", Number, c => c.Timeout),
+            BuildKeyValueParser("publisherConfirms", Bool, c => c.PublisherConfirms),
+            BuildKeyValueParser("persistentMessages", Bool, c => c.PersistentMessages),
+            BuildKeyValueParser("cancelOnHaFailover", Bool, c => c.CancelOnHaFailover),
+            BuildKeyValueParser("product", Text, c => c.Product),
+            BuildKeyValueParser("platform", Text, c => c.Platform)
         }.Aggregate((a, b) => a.Or(b));
 
-        public static Parser<IEnumerable<UpdateConfiguration>> ConnectionStringBuilder = Part.ListDelimitedBy(';');
+        public static Parser<UpdateConfiguration> AMQPAlone =
+            AMQP.Select(_ => (Func<ConnectionConfiguration, ConnectionConfiguration>)(configuration
+                                                                                       =>
+                {
+                    configuration.AMQPConnectionString = _;
+                    return configuration;
+                }));
+
+        public static Parser<IEnumerable<UpdateConfiguration>> ConnectionStringBuilder = Part.ListDelimitedBy(';').Or(AMQPAlone.Once());
 
         public static Parser<UpdateConfiguration> BuildKeyValueParser<T>(
             string keyName,
@@ -41,7 +61,7 @@ namespace EasyNetQ.ConnectionString
             Expression<Func<ConnectionConfiguration, T>> getter)
         {
             return
-                from key in Parse.String(keyName).Token()
+                from key in Parse.CaseInsensitiveString(keyName).Token()
                 from separator in Parse.Char('=')
                 from value in valueParser
                 select (Func<ConnectionConfiguration, ConnectionConfiguration>)(c =>
@@ -66,21 +86,16 @@ namespace EasyNetQ.ConnectionString
         /// <returns></returns>
         public static Action<TContaining, TProperty> CreateSetter<TContaining, TProperty>(Expression<Func<TContaining, TProperty>> getter)
         {
-            if (getter == null)
-                throw new ArgumentNullException("getter");
+            Preconditions.CheckNotNull(getter, "getter");
 
             var memberEx = getter.Body as MemberExpression;
 
-            if (memberEx == null)
-                throw new ArgumentException("Body is not a member-expression.");
+            Preconditions.CheckNotNull(memberEx, "getter", "Body is not a member-expression.");
 
             var property = memberEx.Member as PropertyInfo;
 
-            if (property == null)
-                throw new ArgumentException("Member is not a property.");
-
-            if (!property.CanWrite)
-                throw new ArgumentException("Property is not writable.");
+            Preconditions.CheckNotNull(property, "getter", "Member is not a property.");
+            Preconditions.CheckTrue(property.CanWrite, "getter", "Member is not a writeable property.");
 
             return (Action<TContaining, TProperty>)
                 Delegate.CreateDelegate(typeof(Action<TContaining, TProperty>),
@@ -100,6 +115,6 @@ namespace EasyNetQ.ConnectionString
                 from head in parser
                 from tail in Parse.Char(delimiter).Then(_ => parser).Many()
                 select head.Cons(tail);
-        } 
+        }
     }
 }

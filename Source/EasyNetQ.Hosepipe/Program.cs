@@ -36,6 +36,8 @@ namespace EasyNetQ.Hosepipe
 
         public static void Main(string[] args)
         {
+            var typeNameSerializer = new TypeNameSerializer();
+
             // poor man's dependency injection FTW ;)
             var program = new Program(
                 new ArgParser(), 
@@ -43,8 +45,8 @@ namespace EasyNetQ.Hosepipe
                 new FileMessageWriter(),
                 new MessageReader(), 
                 new QueueInsertion(),
-                new ErrorRetry(new JsonSerializer()),
-                new Conventions());
+                new ErrorRetry(new JsonSerializer(typeNameSerializer)),
+                new Conventions(typeNameSerializer));
             program.Start(args);
         }
 
@@ -66,6 +68,11 @@ namespace EasyNetQ.Hosepipe
             arguments.WithKey("u", a => parameters.Username = a.Value);
             arguments.WithKey("p", a => parameters.Password = a.Value);
             arguments.WithKey("o", a => parameters.MessageFilePath = a.Value);
+            arguments.WithKey("q", a => parameters.QueueName = a.Value);
+            arguments.WithTypedKeyOptional<int>("n", a => parameters.NumberOfMessagesToRetrieve = int.Parse(a.Value))
+                .FailWith(messsage("Invalid number of messages to retrieve"));
+            arguments.WithTypedKeyOptional<bool>("x", a => parameters.Purge = bool.Parse(a.Value))
+                .FailWith(messsage("Invalid purge (x) parameter"));
 
             try
             {
@@ -74,12 +81,8 @@ namespace EasyNetQ.Hosepipe
                     parameters.QueueName = a.Value;
                     Dump(parameters);
                 }).FailWith(messsage("No Queue Name given")));
-            
-                arguments.At(0, "insert", () => arguments.WithKey("q", a =>
-                {
-                    parameters.QueueName = a.Value;
-                    Insert(parameters);
-                }).FailWith(messsage("No Queue Name given")));
+
+                arguments.At(0, "insert", () => Insert(parameters));
 
                 arguments.At(0, "err", () => ErrorDump(parameters));
 
@@ -126,16 +129,19 @@ namespace EasyNetQ.Hosepipe
 
         private void ErrorDump(QueueParameters parameters)
         {
-            parameters.QueueName = conventions.ErrorQueueNamingConvention();
+            if(parameters.QueueName == null)
+                parameters.QueueName = conventions.ErrorQueueNamingConvention();
             Dump(parameters);
         }
 
         private void Retry(QueueParameters parameters)
         {
             var count = 0;
+            var queueName = parameters.QueueName ?? conventions.ErrorQueueNamingConvention();
+            
             errorRetry.RetryErrors(
                 WithEach(
-                    messageReader.ReadMessages(parameters, conventions.ErrorQueueNamingConvention()), 
+                    messageReader.ReadMessages(parameters, queueName), 
                     () => count++), 
                 parameters);
 
@@ -143,7 +149,7 @@ namespace EasyNetQ.Hosepipe
                 count, parameters.MessageFilePath);
         }
 
-        private IEnumerable<string> WithEach(IEnumerable<string> messages, Action action)
+        private IEnumerable<HosepipeMessage> WithEach(IEnumerable<HosepipeMessage> messages, Action action)
         {
             foreach (var message in messages)
             {
